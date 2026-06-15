@@ -13,13 +13,13 @@
  * ============================================================
  *
  *  PIN ASSIGNMENTS:
- *    D3  → Relay 3 (IR Heater)           — Active LOW
- *    D4  → MAX6675 CS
- *    D5  → MAX6675 SCK
- *    D6  → MAX6675 SO (MISO)
- *    D52 → Relay 1 (LPG Solenoid Valve) — Active LOW
- *    D51 → Relay 2 (Fan)                — Active LOW
- *    D40 → Button (INPUT_PULLUP) — START/PAUSE/CONTINUE
+ *    D15 → Relay 3 (IR Heater)           — Active LOW
+ *    D53 → MAX6675 CS
+ *    D52 → MAX6675 SCK
+ *    D50 → MAX6675 SO (MISO)
+ *    D14 → Relay 1 (LPG Solenoid Valve) — Active LOW
+ *    D48 → Relay 2 (Fan)                — Active LOW
+ *    D42 → Button (INPUT_PULLUP) — START/PAUSE/CONTINUE
  *    A4  → I2C SDA (LCD + RTC)
  *    A5  → I2C SCL (LCD + RTC)
  *
@@ -39,13 +39,13 @@
 #include <PID_v1.h>
 
 // ─── PIN DEFINITIONS ────────────────────────────────────────
-#define PIN_HEATER       3    // IR Heater relay (Active LOW)
-#define PIN_TC_CS        4    // MAX6675 Chip Select
-#define PIN_TC_SCK       5    // MAX6675 Clock
-#define PIN_TC_SO        6    // MAX6675 Data Out
-#define PIN_RELAY_VALVE 52    // LPG Solenoid Valve relay (Active LOW)
-#define PIN_RELAY_FAN   51    // Tempering Fan relay (Active LOW)
-#define PIN_BUTTON      40    // Single push button
+#define PIN_HEATER       15    // IR Heater relay (Active LOW)
+#define PIN_TC_CS        53    // MAX6675 Chip Select
+#define PIN_TC_SCK       52    // MAX6675 Clock
+#define PIN_TC_SO        50    // MAX6675 Data Out
+#define PIN_RELAY_VALVE 14    // LPG Solenoid Valve relay (Active LOW)
+#define PIN_RELAY_FAN   48    // Tempering Fan relay (Active LOW)
+#define PIN_BUTTON      42    // Single push button
 
 // ─── PHASE SETPOINTS ────────────────────────────────────────
 #define PHASE1_SETPOINT     100.0   // Pre-heating target
@@ -230,7 +230,12 @@ void displayPhase(uint8_t phase, unsigned long elapsedMs, unsigned long totalMs)
   sprintf(line1, "PHASE:%d TM:%02lu:%02lu", phase, remainingMins, remainingSecs);
   
   // Line 2: SP:XXX CT:XXX.X
-  sprintf(line2, "SP:%.0f CT:%.1f", pidSetpoint, currentTemp);
+  // FIX 1: Manual conversion for floating point (sprintf doesn't support %f on Arduino)
+  int spInt = (int)pidSetpoint;
+  int ctInt = (int)currentTemp;
+  int ctDec = (int)((currentTemp - ctInt) * 10);
+  if (ctDec < 0) ctDec = -ctDec;  // Handle negative decimal part
+  sprintf(line2, "SP:%3d CT:%3d.%1d", spInt, ctInt, ctDec);
 
   lcd.setCursor(0, 0);
   lcd.print(line1);
@@ -249,7 +254,7 @@ void displayPaused() {
   lcd.setCursor(0, 0);
   lcd.print("*** PAUSED ***");
   lcd.setCursor(0, 1);
-  lcd.print("PRESS TO CONTINUE");
+  lcd.print("PRESS CONTINUE");
 }
 
 void displayError() {
@@ -263,7 +268,10 @@ void displayError() {
 
 void displayDone() {
   char line1[17], line2[17];
-  sprintf(line1, "PEAK:%5.1f", peakTemp);
+  int peakInt = (int)peakTemp;
+  int peakDec = (int)((peakTemp - peakInt) * 10);
+  if (peakDec < 0) peakDec = -peakDec;  // Handle negative decimal part
+  sprintf(line1, "PEAK:%3d.%1d", peakInt, peakDec);
   sprintf(line2, "DONE-PRESS RST");
   
   lcd.setCursor(0, 0);
@@ -379,9 +387,10 @@ void setup() {
   pinMode(PIN_RELAY_FAN,   OUTPUT);
   pinMode(PIN_BUTTON,      INPUT_PULLUP);
 
-  digitalWrite(PIN_HEATER,       HIGH);
-  digitalWrite(PIN_RELAY_VALVE, HIGH);
-  digitalWrite(PIN_RELAY_FAN,   HIGH);
+  // FIX 2: All relays start LOW (OFF for Active LOW relays)
+  digitalWrite(PIN_HEATER,       LOW);
+  digitalWrite(PIN_RELAY_VALVE, LOW);
+  digitalWrite(PIN_RELAY_FAN,   LOW);
 
   // LCD
   lcd.init();
@@ -432,6 +441,7 @@ void setup() {
   Serial.println(PID_KD);
   Serial.println(F("  Heater ctrl  : Digital ON/OFF (PID-based)"));
   Serial.println(F("  Button       : START/PAUSE/CONTINUE (all halts when paused)"));
+  Serial.println(F("  Relay init   : All relays start LOW (OFF)"));
   printSeparator();
   Serial.println();
 
