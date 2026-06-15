@@ -72,7 +72,6 @@
 #define FAN_HYSTERESIS          1.0    // Turn fan OFF if temp < setpoint + 3°C - 1°C
 
 // ─── SAFETY LIMITS ──────────────────────────────────────────
-#define OVERTEMP_MARGIN     20.0
 #define HEATER_FAIL_TIME_MS 120000UL
 
 // ─── BUTTON TIMING ──────────────────────────────────────────
@@ -230,7 +229,7 @@ void displayPhase(uint8_t phase, unsigned long elapsedMs, unsigned long totalMs)
   sprintf(line1, "PHASE:%d TM:%02lu:%02lu", phase, remainingMins, remainingSecs);
   
   // Line 2: SP:XXX CT:XXX.X
-  // FIX 1: Manual conversion for floating point (sprintf doesn't support %f on Arduino)
+  // Manual conversion for floating point (sprintf doesn't support %f on Arduino)
   int spInt = (int)pidSetpoint;
   int ctInt = (int)currentTemp;
   int ctDec = (int)((currentTemp - ctInt) * 10);
@@ -322,6 +321,7 @@ void logTransition(SystemState from, SystemState to) {
 void checkSafety() {
   double raw = thermocouple.readCelsius();
 
+  // SENSOR FAULT DETECTION
   if (isnan(raw) || raw <= 0.0) {
     allOff();
     errorMessage = "SENSOR FAULT!";
@@ -334,22 +334,7 @@ void checkSafety() {
     return;
   }
 
-  if (currentTemp > (pidSetpoint + OVERTEMP_MARGIN)) {
-    allOff();
-    errorMessage = "OVER TEMP!!!";
-    SystemState prev = currentState;
-    currentState = STATE_ERROR;
-    lcd.clear();
-    printSeparator();
-    Serial.print(F("[SAFETY] *** OVER TEMP! TEMP="));
-    Serial.print(currentTemp, 1);
-    Serial.print(F("C  LIMIT="));
-    Serial.print(pidSetpoint + OVERTEMP_MARGIN, 1);
-    Serial.println(F("C — ALL OUTPUTS OFF ***"));
-    logTransition(prev, currentState);
-    return;
-  }
-
+  // HEATER FAILURE WATCHDOG (only in Phase 2 when actively heating)
   if (currentState == STATE_PHASE2_ROAST) {
     if (heaterOn && currentTemp < (pidSetpoint - 20.0)) {
       if (!heaterFailArmed) {
@@ -387,7 +372,7 @@ void setup() {
   pinMode(PIN_RELAY_FAN,   OUTPUT);
   pinMode(PIN_BUTTON,      INPUT_PULLUP);
 
-  // FIX 2: All relays start LOW (OFF for Active LOW relays)
+  // All relays start LOW (OFF for Active LOW relays)
   digitalWrite(PIN_HEATER,       LOW);
   digitalWrite(PIN_RELAY_VALVE, LOW);
   digitalWrite(PIN_RELAY_FAN,   LOW);
@@ -441,7 +426,8 @@ void setup() {
   Serial.println(PID_KD);
   Serial.println(F("  Heater ctrl  : Digital ON/OFF (PID-based)"));
   Serial.println(F("  Button       : START/PAUSE/CONTINUE (all halts when paused)"));
-  Serial.println(F("  Relay init   : All relays start LOW (OFF)"));
+  Serial.println(F("  Safety check : Sensor fault + Heater failure detection only"));
+  Serial.println(F("  NO OVERTEMP  : Process-driven phases (no temp-based shutdown)"));
   printSeparator();
   Serial.println();
 
