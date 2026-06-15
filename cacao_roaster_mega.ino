@@ -5,22 +5,21 @@
  *  Components:
  *    - MAX6675 K-Type Thermocouple
  *    - DS3231 RTC
- *    - I2C LCD 20x4
- *    - DimmableLight (IR Heater via TRIAC)
+ *    - I2C LCD 16x2
+ *    - Relay 3 → IR Heater (ON/OFF only, controlled by PID)
  *    - Relay 1 → LPG Solenoid Valve
- *    - Relay 2 → Tempering Fan
- *    - Single Push Button
+ *    - Relay 2 → Tempering Fan (for cooling & overshoot prevention)
+ *    - Single Push Button (START/PAUSE/CONTINUE)
  * ============================================================
  *
  *  PIN ASSIGNMENTS:
- *    D18 → Zero-Cross input (INT5 on Mega) — used by DimmableLight
- *    D3  → TRIAC gate (DimmableLight output)
+ *    D3  → Relay 3 (IR Heater)           — Active LOW
  *    D4  → MAX6675 CS
  *    D5  → MAX6675 SCK
  *    D6  → MAX6675 SO (MISO)
  *    D52 → Relay 1 (LPG Solenoid Valve) — Active LOW
  *    D51 → Relay 2 (Fan)                — Active LOW
- *    D40 → Button (INPUT_PULLUP)
+ *    D40 → Button (INPUT_PULLUP) — START/PAUSE/CONTINUE
  *    A4  → I2C SDA (LCD + RTC)
  *    A5  → I2C SCL (LCD + RTC)
  *
@@ -30,7 +29,6 @@
  *    - max6675.h            (Adafruit)
  *    - RTClib.h             (Adafruit)
  *    - PID_v1.h             (Brett Beauregard)
- *    - DimmableLight.h      (Fabiano Riccardi — "Dimmable Light for Arduino" v1.6+)
  * ============================================================
  */
 
@@ -39,11 +37,9 @@
 #include <max6675.h>
 #include <RTClib.h>
 #include <PID_v1.h>
-#include <DimmableLight.h>
 
 // ─── PIN DEFINITIONS ────────────────────────────────────────
-#define PIN_ZC          18    // Zero-cross input (INT5 on Mega)
-#define PIN_DIMMER       3    // TRIAC gate output
+#define PIN_HEATER       3    // IR Heater relay (Active LOW)
 #define PIN_TC_CS        4    // MAX6675 Chip Select
 #define PIN_TC_SCK       5    // MAX6675 Clock
 #define PIN_TC_SO        6    // MAX6675 Data Out
@@ -51,27 +47,29 @@
 #define PIN_RELAY_FAN   51    // Tempering Fan relay (Active LOW)
 #define PIN_BUTTON      40    // Single push button
 
-// ─── TIMING CONSTANTS ───────────────────────────────────────
-#define PHASE1_DURATION_MS   300000UL   // 5 min
-#define PHASE2_DURATION_MS   1500000UL  // 25 min
-#define TOTAL_ROAST_MS       1800000UL  // 30 min total
-#define COOLING_TEMP_TARGET  50.0       // Stop fan below this °C
+// ─── PHASE SETPOINTS ────────────────────────────────────────
+#define PHASE1_SETPOINT     100.0   // Pre-heating target
+#define PHASE1_END_TEMP     100.0   // End Phase 1 when reached
+#define PHASE2_SETPOINT     110.0   // Roasting target
+#define PHASE3_SETPOINT     110.0   // Tempering (no heating, just timer)
 
-// ─── PID SETTINGS ───────────────────────────────────────────
-#define PID_KP              2.0
-#define PID_KI              0.5
-#define PID_KD              1.0
+// ─── PHASE TIMERS ───────────────────────────────────────────
+#define PHASE1_TIMEOUT_MS   1200000UL  // 20 min max (safety limit, ends when 100°C reached)
+#define PHASE2_DURATION_MS  1800000UL  // 30 min roasting
+#define PHASE3_DURATION_MS  600000UL   // 10 min tempering
+
+// ─── PID SETTINGS (for ON/OFF control) ──────────────────────
+#define PID_KP              3.0
+#define PID_KI              0.1
+#define PID_KD              2.0
 #define PID_SAMPLE_MS       250
 
-// ─── FAN FEEDBACK (anti-overshoot) ──────────────────────────
-#define FAN_ON_THRESHOLD    3.0
-#define FAN_OFF_HYSTERESIS  1.0
+// ─── HEATER ON/OFF THRESHOLD ────────────────────────────────
+#define HEATER_THRESHOLD    127
 
-// ─── SETPOINT SETTINGS ──────────────────────────────────────
-#define SETPOINT_MIN        160
-#define SETPOINT_MAX        230
-#define SETPOINT_STEP       5
-#define SETPOINT_DEFAULT    200
+// ─── FAN CONTROL (cooling & overshoot prevention) ───────────
+#define FAN_OVERSHOOT_MARGIN    3.0    // Turn fan ON if temp > setpoint + 3°C
+#define FAN_HYSTERESIS          1.0    // Turn fan OFF if temp < setpoint + 3°C - 1°C
 
 // ─── SAFETY LIMITS ──────────────────────────────────────────
 #define OVERTEMP_MARGIN     20.0
@@ -82,24 +80,23 @@
 #define BTN_LONG_PRESS_MS   1500
 
 // ─── OBJECTS ────────────────────────────────────────────────
-LiquidCrystal_I2C lcd(0x27, 20, 4);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 MAX6675           thermocouple(PIN_TC_SCK, PIN_TC_CS, PIN_TC_SO);
 RTC_DS3231        rtc;
-DimmableLight     dimmer(PIN_DIMMER);
 
 // ─── PID VARIABLES ──────────────────────────────────────────
 double pidInput    = 0.0;
 double pidOutput   = 0.0;
-double pidSetpoint = SETPOINT_DEFAULT;
+double pidSetpoint = PHASE1_SETPOINT;
 PID myPID(&pidInput, &pidOutput, &pidSetpoint, PID_KP, PID_KI, PID_KD, DIRECT);
 
 // ─── STATE MACHINE ──────────────────────────────────────────
 enum SystemState {
   STATE_IDLE,
-  STATE_SET_SETPOINT,
   STATE_PHASE1_PREHEAT,
   STATE_PHASE2_ROAST,
-  STATE_COOLING,
+  STATE_PHASE3_TEMPER,
+  STATE_PAUSED,
   STATE_DONE,
   STATE_ERROR
 };
@@ -108,36 +105,29 @@ enum ButtonEvent { BTN_NONE, BTN_SHORT, BTN_LONG };
 
 // ─── GLOBAL STATE ───────────────────────────────────────────
 SystemState currentState = STATE_IDLE;
+SystemState pausedFromState = STATE_IDLE;  // Track which state we paused from
 String      errorMessage = "";
 
 // ─── RUNTIME VARIABLES ──────────────────────────────────────
-int    setpointTemp  = SETPOINT_DEFAULT;
 double currentTemp   = 0.0;
 double peakTemp      = 0.0;
 bool   fanOn         = false;
 bool   valveOpen     = false;
+bool   heaterOn      = false;
 
 unsigned long phaseStartTime   = 0;
+unsigned long pausedTime       = 0;      // When paused, store remaining time
 unsigned long lastPIDTime      = 0;
 unsigned long lastTempReadTime = 0;
 unsigned long lastLCDTime      = 0;
 unsigned long heaterFailTimer  = 0;
 bool          heaterFailArmed  = false;
 
-DateTime roastStartTime;
-DateTime roastEndTime;
-
 // ─── BUTTON VARIABLES ───────────────────────────────────────
 bool          btnLastState     = HIGH;
 bool          btnCurrentState  = HIGH;
 unsigned long btnPressTime     = 0;
 bool          longPressHandled = false;
-
-// ─── CUSTOM LCD CHARACTER: DEGREE SYMBOL ────────────────────
-byte degChar[8] = {
-  0b00110, 0b01001, 0b01001, 0b00110,
-  0b00000, 0b00000, 0b00000, 0b00000
-};
 
 // ============================================================
 //  RELAY HELPERS (Active LOW)
@@ -146,9 +136,8 @@ void valveOpen_() { digitalWrite(PIN_RELAY_VALVE, LOW);  valveOpen = true;  }
 void valveClose() { digitalWrite(PIN_RELAY_VALVE, HIGH); valveOpen = false; }
 void fanOn_()     { digitalWrite(PIN_RELAY_FAN,   LOW);  fanOn     = true;  }
 void fanOff()     { digitalWrite(PIN_RELAY_FAN,   HIGH); fanOn     = false; }
-
-void heaterSetPower(uint8_t power) { dimmer.setBrightness(power); }
-void heaterOff()                   { dimmer.setBrightness(0);     }
+void heaterOn_()  { digitalWrite(PIN_HEATER, LOW);  heaterOn = true;  }
+void heaterOff()  { digitalWrite(PIN_HEATER, HIGH); heaterOn = false; }
 
 void allOff() {
   heaterOff();
@@ -168,12 +157,24 @@ bool readTemperature() {
 }
 
 // ============================================================
-//  FAN FEEDBACK CONTROL
+//  HEATER CONTROL (PID-based ON/OFF)
 // ============================================================
-void updateFanFeedback() {
-  if (currentTemp >= (pidSetpoint + FAN_ON_THRESHOLD)) {
+void updateHeater() {
+  if (pidOutput > HEATER_THRESHOLD) {
+    heaterOn_();
+  } else {
+    heaterOff();
+  }
+}
+
+// ============================================================
+//  FAN CONTROL (overshoot prevention + cooling)
+// ============================================================
+void updateFan() {
+  if (currentTemp >= (pidSetpoint + FAN_OVERSHOOT_MARGIN)) {
     fanOn_();
-  } else if (currentTemp < (pidSetpoint + FAN_ON_THRESHOLD - FAN_OFF_HYSTERESIS)) {
+  } 
+  else if (currentTemp < (pidSetpoint + FAN_OVERSHOOT_MARGIN - FAN_HYSTERESIS)) {
     fanOff();
   }
 }
@@ -214,115 +215,61 @@ ButtonEvent readButton() {
 }
 
 // ============================================================
-//  LCD HELPERS
+//  LCD DISPLAY (16x2)
 // ============================================================
-void lcdClear() { lcd.clear(); }
+void displayPhase(uint8_t phase, unsigned long elapsedMs, unsigned long totalMs) {
+  char line1[17], line2[17];
+  
+  // Calculate remaining time
+  unsigned long remainingMs = (elapsedMs < totalMs) ? (totalMs - elapsedMs) : 0;
+  unsigned long remainingSecs = remainingMs / 1000;
+  unsigned long remainingMins = remainingSecs / 60;
+  remainingSecs = remainingSecs % 60;
 
-String formatTime(unsigned long ms) {
-  unsigned long secs = ms / 1000;
-  unsigned long mins = secs / 60;
-  secs = secs % 60;
-  char buf[6];
-  sprintf(buf, "%02lu:%02lu", mins, secs);
-  return String(buf);
+  // Line 1: PHASE:X TM:MM:SS
+  sprintf(line1, "PHASE:%d TM:%02lu:%02lu", phase, remainingMins, remainingSecs);
+  
+  // Line 2: SP:XXX CT:XXX.X
+  sprintf(line2, "SP:%.0f CT:%.1f", pidSetpoint, currentTemp);
+
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
 }
 
-// ============================================================
-//  LCD DISPLAY FUNCTIONS
-// ============================================================
 void displayIdle() {
-  DateTime now = rtc.now();
-  char timeBuf[9], dateBuf[11];
-  sprintf(timeBuf, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
-  sprintf(dateBuf, "%04d-%02d-%02d", now.year(), now.month(), now.day());
-
-  lcd.setCursor(0, 0); lcd.print(F("  CACAO ROASTER     "));
-  lcd.setCursor(0, 1); lcd.print(F("  ")); lcd.print(timeBuf); lcd.print(F("         "));
-  lcd.setCursor(0, 2); lcd.print(F("  ")); lcd.print(dateBuf); lcd.print(F("     "));
-  lcd.setCursor(0, 3); lcd.print(F(" PRESS TO SET TEMP  "));
-}
-
-void displaySetpoint() {
-  lcd.setCursor(0, 0); lcd.print(F("  SET ROAST TEMP    "));
-  lcd.setCursor(0, 1); lcd.print(F("                    "));
-  lcd.setCursor(0, 2);
-  char buf[17];
-  sprintf(buf, "   SETPOINT: %3d", setpointTemp);
-  lcd.print(buf); lcd.write(0); lcd.print(F("C  "));
-  lcd.setCursor(0, 3); lcd.print(F(" SHORT=+5 LONG=START"));
-}
-
-void displayPhase1() {
-  unsigned long elapsed   = millis() - phaseStartTime;
-  unsigned long remaining = (elapsed < PHASE1_DURATION_MS) ? (PHASE1_DURATION_MS - elapsed) : 0;
-
-  lcd.setCursor(0, 0); lcd.print(F("PHASE 1: PRE-HEAT   "));
+  lcd.setCursor(0, 0);
+  lcd.print("CACAO  ROASTER");
   lcd.setCursor(0, 1);
-  char buf[21];
-  sprintf(buf, "TIME: %s REM:%s", formatTime(elapsed).c_str(), formatTime(remaining).c_str());
-  lcd.print(buf);
-  lcd.setCursor(0, 2);
-  char tbuf[21];
-  sprintf(tbuf, "TEMP:%5.1f", currentTemp);
-  lcd.print(tbuf); lcd.write(0); lcd.print(F("C SP:")); lcd.print(setpointTemp); lcd.write(0); lcd.print(F("C "));
-  lcd.setCursor(0, 3);
-  lcd.print(F("FAN:"));   lcd.print(fanOn     ? F("ON  ") : F("OFF "));
-  lcd.print(F("VALVE:")); lcd.print(valveOpen ? F("OPEN ") : F("CLSD "));
+  lcd.print("PRESS TO START");
 }
 
-void displayPhase2() {
-  unsigned long elapsed   = millis() - phaseStartTime;
-  unsigned long remaining = (elapsed < PHASE2_DURATION_MS) ? (PHASE2_DURATION_MS - elapsed) : 0;
-  int irPct = (int)map((long)pidOutput, 0, 255, 0, 100);
-
-  lcd.setCursor(0, 0); lcd.print(F("PHASE 2: ROASTING   "));
+void displayPaused() {
+  lcd.setCursor(0, 0);
+  lcd.print("*** PAUSED ***");
   lcd.setCursor(0, 1);
-  char buf[21];
-  sprintf(buf, "TIME: %s REM:%s", formatTime(elapsed).c_str(), formatTime(remaining).c_str());
-  lcd.print(buf);
-  lcd.setCursor(0, 2);
-  char tbuf[21];
-  sprintf(tbuf, "TEMP:%5.1f", currentTemp);
-  lcd.print(tbuf); lcd.write(0); lcd.print(F("C SP:")); lcd.print(setpointTemp); lcd.write(0); lcd.print(F("C "));
-  lcd.setCursor(0, 3);
-  lcd.print(F("IR:"));
-  char pbuf[4]; sprintf(pbuf, "%3d", irPct); lcd.print(pbuf);
-  lcd.print(F("% FAN:")); lcd.print(fanOn ? F("ON  ") : F("OFF "));
-}
-
-void displayCooling() {
-  lcd.setCursor(0, 0); lcd.print(F("    COOLING DOWN    "));
-  lcd.setCursor(0, 1); lcd.print(F("                    "));
-  lcd.setCursor(0, 2);
-  char tbuf[21];
-  sprintf(tbuf, "  TEMP: %5.1f", currentTemp);
-  lcd.print(tbuf); lcd.write(0); lcd.print(F("C       "));
-  lcd.setCursor(0, 3); lcd.print(F("  FAN: ON           "));
-}
-
-void displayDone() {
-  unsigned long totalMs = (roastEndTime.unixtime() - roastStartTime.unixtime()) * 1000UL;
-
-  lcd.setCursor(0, 0); lcd.print(F("   ROAST COMPLETE   "));
-  lcd.setCursor(0, 1);
-  char tbuf[21];
-  sprintf(tbuf, "PEAK TEMP: %5.1f", peakTemp);
-  lcd.print(tbuf); lcd.write(0); lcd.print(F("C "));
-  lcd.setCursor(0, 2);
-  char timebuf[21];
-  sprintf(timebuf, "DURATION:   %s   ", formatTime(totalMs).c_str());
-  lcd.print(timebuf);
-  lcd.setCursor(0, 3); lcd.print(F(" PRESS TO RESTART   "));
+  lcd.print("PRESS TO CONTINUE");
 }
 
 void displayError() {
-  lcd.setCursor(0, 0); lcd.print(F("!!!!  ERROR  !!!!   "));
-  lcd.setCursor(0, 1); lcd.print(F("                    "));
-  lcd.setCursor(0, 2);
+  lcd.setCursor(0, 0);
+  lcd.print("!!! ERROR !!!");
+  lcd.setCursor(0, 1);
   String padded = errorMessage;
-  while (padded.length() < 20) padded += " ";
-  lcd.print(padded.substring(0, 20));
-  lcd.setCursor(0, 3); lcd.print(F(" PRESS TO RESET     "));
+  while (padded.length() < 16) padded += " ";
+  lcd.print(padded.substring(0, 16));
+}
+
+void displayDone() {
+  char line1[17], line2[17];
+  sprintf(line1, "PEAK:%5.1f", peakTemp);
+  sprintf(line2, "DONE-PRESS RST");
+  
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
 }
 
 // ============================================================
@@ -335,10 +282,10 @@ void printSeparator() {
 void printStateLabel(SystemState s) {
   switch (s) {
     case STATE_IDLE:           Serial.print(F("IDLE"));           break;
-    case STATE_SET_SETPOINT:   Serial.print(F("SET_SETPOINT"));   break;
     case STATE_PHASE1_PREHEAT: Serial.print(F("PHASE1_PREHEAT")); break;
     case STATE_PHASE2_ROAST:   Serial.print(F("PHASE2_ROAST"));   break;
-    case STATE_COOLING:        Serial.print(F("COOLING"));        break;
+    case STATE_PHASE3_TEMPER:  Serial.print(F("PHASE3_TEMPER"));  break;
+    case STATE_PAUSED:         Serial.print(F("PAUSED"));         break;
     case STATE_DONE:           Serial.print(F("DONE"));           break;
     case STATE_ERROR:          Serial.print(F("ERROR"));          break;
     default:                   Serial.print(F("UNKNOWN"));        break;
@@ -357,9 +304,7 @@ void logTransition(SystemState from, SystemState to) {
   printStateLabel(from);
   Serial.print(F(" --> "));
   printStateLabel(to);
-  Serial.print(F("  (uptime: "));
-  Serial.print(millis() / 1000UL);
-  Serial.println(F("s)"));
+  Serial.println(F("]"));
   printSeparator();
 }
 
@@ -371,10 +316,10 @@ void checkSafety() {
 
   if (isnan(raw) || raw <= 0.0) {
     allOff();
-    errorMessage = "  SENSOR FAULT!     ";
+    errorMessage = "SENSOR FAULT!";
     SystemState prev = currentState;
     currentState = STATE_ERROR;
-    lcdClear();
+    lcd.clear();
     printSeparator();
     Serial.println(F("[SAFETY] *** SENSOR FAULT — ALL OUTPUTS OFF ***"));
     logTransition(prev, currentState);
@@ -383,10 +328,10 @@ void checkSafety() {
 
   if (currentTemp > (pidSetpoint + OVERTEMP_MARGIN)) {
     allOff();
-    errorMessage = "   OVER TEMP!!!     ";
+    errorMessage = "OVER TEMP!!!";
     SystemState prev = currentState;
     currentState = STATE_ERROR;
-    lcdClear();
+    lcd.clear();
     printSeparator();
     Serial.print(F("[SAFETY] *** OVER TEMP! TEMP="));
     Serial.print(currentTemp, 1);
@@ -398,19 +343,19 @@ void checkSafety() {
   }
 
   if (currentState == STATE_PHASE2_ROAST) {
-    if (pidOutput >= 254 && currentTemp < (pidSetpoint - 20.0)) {
+    if (heaterOn && currentTemp < (pidSetpoint - 20.0)) {
       if (!heaterFailArmed) {
         heaterFailArmed = true;
         heaterFailTimer = millis();
-        Serial.println(F("[SAFETY] Heater fail watchdog ARMED (100% output, temp low)"));
+        Serial.println(F("[SAFETY] Heater fail watchdog ARMED (heater ON, temp low)"));
       } else if (millis() - heaterFailTimer > HEATER_FAIL_TIME_MS) {
         allOff();
-        errorMessage = "  HEATER FAILURE    ";
+        errorMessage = "HEATER FAILURE";
         SystemState prev = currentState;
         currentState = STATE_ERROR;
-        lcdClear();
+        lcd.clear();
         printSeparator();
-        Serial.println(F("[SAFETY] *** HEATER FAILURE! >2min at 100%, no temp rise — ALL OUTPUTS OFF ***"));
+        Serial.println(F("[SAFETY] *** HEATER FAILURE! >2min ON, no temp rise — ALL OUTPUTS OFF ***"));
         logTransition(prev, currentState);
         return;
       }
@@ -429,80 +374,70 @@ void checkSafety() {
 void setup() {
   Serial.begin(9600);
 
+  pinMode(PIN_HEATER,       OUTPUT);
   pinMode(PIN_RELAY_VALVE, OUTPUT);
   pinMode(PIN_RELAY_FAN,   OUTPUT);
   pinMode(PIN_BUTTON,      INPUT_PULLUP);
 
+  digitalWrite(PIN_HEATER,       HIGH);
   digitalWrite(PIN_RELAY_VALVE, HIGH);
   digitalWrite(PIN_RELAY_FAN,   HIGH);
 
   // LCD
   lcd.init();
   lcd.backlight();
-  lcd.createChar(0, degChar);
-  lcdClear();
+  lcd.clear();
 
   // RTC
   if (!rtc.begin()) {
-    lcd.setCursor(0, 0); lcd.print(F("RTC NOT FOUND!"));
+    lcd.setCursor(0, 0);
+    lcd.print("RTC NOT FOUND!");
     Serial.println(F("[ERROR] RTC not found! Halting."));
     while (1);
   }
 
-  // ── RTC lost-power: show single error line, block until fixed ──
+  // ── RTC lost-power ──
   if (rtc.lostPower()) {
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
     Serial.println(F("[WARN] RTC lost power — replace CR2032 battery."));
-
-    lcdClear();
-    lcd.setCursor(0, 1); lcd.print(F(" WARN: RTC NO POWER "));
-    lcd.setCursor(0, 2); lcd.print(F(" REPLACE CR2032     "));
-
-    while (rtc.lostPower()) { delay(500); }   // hold here until battery replaced
-
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WARN: RTC NO PWR");
+    lcd.setCursor(0, 1);
+    lcd.print("Replace CR2032");
+    
+    while (rtc.lostPower()) { delay(500); }
+    
     Serial.println(F("[INFO] RTC power restored — continuing."));
-    lcdClear();
+    lcd.clear();
   }
-
-  // DimmableLight
-  DimmableLight::setSyncPin(PIN_ZC);
-  DimmableLight::begin();
-  dimmer.setBrightness(0);
 
   // PID
   myPID.SetMode(MANUAL);
   myPID.SetOutputLimits(0, 255);
   myPID.SetSampleTime(PID_SAMPLE_MS);
 
-  // Splash
-  lcdClear();
-  lcd.setCursor(0, 0); lcd.print(F("  CACAO ROASTER     "));
-  lcd.setCursor(0, 1); lcd.print(F("  Initializing...   "));
-
   // Boot banner
   printSeparator();
   Serial.println(F("      CACAO ROASTER CONTROLLER — BOOT      "));
   printSeparator();
   Serial.println(F("  Baud         : 9600"));
-  Serial.print(  F("  Default SP   : ")); Serial.print(SETPOINT_DEFAULT);           Serial.println(F(" C"));
-  Serial.print(  F("  Phase 1      : ")); Serial.print(PHASE1_DURATION_MS/60000UL); Serial.println(F(" min (LPG preheat)"));
-  Serial.print(  F("  Phase 2      : ")); Serial.print(PHASE2_DURATION_MS/60000UL); Serial.println(F(" min (IR roast)"));
-  Serial.print(  F("  Overtemp     : +")); Serial.print(OVERTEMP_MARGIN, 0);        Serial.println(F(" C above SP"));
-  Serial.print(  F("  Cool target  : <=")); Serial.print(COOLING_TEMP_TARGET, 0);   Serial.println(F(" C"));
+  Serial.print(  F("  Phase 1 SP   : ")); Serial.print(PHASE1_SETPOINT);   Serial.println(F(" C (until 100C reached)"));
+  Serial.print(  F("  Phase 2 SP   : ")); Serial.print(PHASE2_SETPOINT);   Serial.println(F(" C for 30 min"));
+  Serial.print(  F("  Phase 3 SP   : ")); Serial.print(PHASE3_SETPOINT);   Serial.println(F(" C for 10 min (heater OFF)"));
   Serial.print(  F("  PID Kp/Ki/Kd : "));
   Serial.print(PID_KP); Serial.print(F(" / "));
   Serial.print(PID_KI); Serial.print(F(" / "));
   Serial.println(PID_KD);
-  Serial.println(F("  Dimmer lib   : DimmableLight (Fabiano Riccardi) v1.6+"));
-  Serial.print(  F("  ZC pin       : D")); Serial.print(PIN_ZC); Serial.println(F(" (INT5)"));
-  Serial.print(  F("  Gate pin     : D")); Serial.println(PIN_DIMMER);
-  printSeparator();
-  Serial.println(F("  FORMAT: [HH:MM:SS] STATE | TEMP | SP | PEAK | ..."));
+  Serial.println(F("  Heater ctrl  : Digital ON/OFF (PID-based)"));
+  Serial.println(F("  Button       : START/PAUSE/CONTINUE (all halts when paused)"));
   printSeparator();
   Serial.println();
 
   delay(1500);
-  lcdClear();
+  lcd.clear();
+  displayIdle();
   currentState = STATE_IDLE;
 }
 
@@ -520,7 +455,7 @@ void loop() {
 
   if (currentState == STATE_PHASE1_PREHEAT ||
       currentState == STATE_PHASE2_ROAST   ||
-      currentState == STATE_COOLING) {
+      currentState == STATE_PHASE3_TEMPER) {
     checkSafety();
     if (currentState == STATE_ERROR) return;
   }
@@ -537,147 +472,199 @@ void loop() {
         displayIdle();
       }
 
-      if (btn == BTN_SHORT || btn == BTN_LONG) {
-        setpointTemp = SETPOINT_DEFAULT;
-        lcdClear();
-        SystemState prev = currentState;
-        currentState = STATE_SET_SETPOINT;
-        logTransition(prev, currentState);
-        Serial.print(F("[EVENT] Button → setpoint config. Default SP="));
-        Serial.print(setpointTemp); Serial.println(F("C"));
-      }
-      break;
-
-    case STATE_SET_SETPOINT:
       if (btn == BTN_SHORT) {
-        setpointTemp += SETPOINT_STEP;
-        if (setpointTemp > SETPOINT_MAX) setpointTemp = SETPOINT_MIN;
-        displaySetpoint();
-        Serial.print(F("[SETPOINT] Adjusted to: "));
-        Serial.print(setpointTemp); Serial.println(F("C"));
-      }
-
-      if (btn == BTN_LONG) {
-        pidSetpoint     = setpointTemp;
-        phaseStartTime  = millis();
-        roastStartTime  = rtc.now();
+        // Start roasting process
+        phaseStartTime = millis();
+        pidSetpoint = PHASE1_SETPOINT;
+        myPID.SetMode(MANUAL);
         heaterFailArmed = false;
-        lcdClear();
-
-        Serial.print(F("[SETPOINT] Confirmed: "));
-        Serial.print(setpointTemp);
-        Serial.println(F("C — starting Phase 1"));
-
+        peakTemp = 0.0;
+        
+        lcd.clear();
         SystemState prev = currentState;
         currentState = STATE_PHASE1_PREHEAT;
         logTransition(prev, currentState);
-
+        
         valveOpen_();
         heaterOff();
-
-        Serial.println(F("[OUTPUT] LPG Valve: OPEN"));
-        Serial.println(F("[OUTPUT] IR Heater: OFF (brightness=0)"));
-        Serial.println(F("[OUTPUT] Fan: feedback mode"));
-      }
-
-      if (now - lastLCDTime >= 200) {
-        lastLCDTime = now;
-        displaySetpoint();
+        
+        Serial.println(F("[OUTPUT] Phase 1: LPG Valve OPEN, Heater OFF"));
+        Serial.println(F("[OUTPUT] Waiting to reach 100C..."));
       }
       break;
 
-    case STATE_PHASE1_PREHEAT:
-      updateFanFeedback();
+    case STATE_PHASE1_PREHEAT: {
+      unsigned long elapsedMs = now - phaseStartTime;
+      
+      updateFan();
 
       if (now - lastLCDTime >= 500) {
         lastLCDTime = now;
-        displayPhase1();
+        displayPhase(1, elapsedMs, PHASE1_TIMEOUT_MS);
       }
 
-      if (now - phaseStartTime >= PHASE1_DURATION_MS) {
+      // End Phase 1 when 100°C is reached
+      if (currentTemp >= PHASE1_END_TEMP) {
         valveClose();
         fanOff();
-        Serial.println(F("[OUTPUT] Phase 1 done — LPG Valve: CLOSED, Fan: OFF"));
-        Serial.println(F("[OUTPUT] Starting IR Heater + PID..."));
+        Serial.println(F("[OUTPUT] Phase 1 done — 100C reached!"));
+        Serial.println(F("[OUTPUT] LPG Valve: CLOSED"));
+        Serial.println(F("[OUTPUT] Starting Phase 2: Roasting with PID control..."));
 
+        pidSetpoint = PHASE2_SETPOINT;
         pidInput = currentTemp;
         myPID.SetMode(AUTOMATIC);
-        dimmer.setBrightness(0);
+        heaterOff();
         phaseStartTime = millis();
-        lcdClear();
+        heaterFailArmed = false;
+        lastLCDTime = now;
+        lcd.clear();
 
         SystemState prev = currentState;
         currentState = STATE_PHASE2_ROAST;
         logTransition(prev, currentState);
       }
 
-      if (btn == BTN_LONG) {
-        Serial.println(F("[EVENT] Emergency stop in Phase 1 — cooling"));
+      // Safety: timeout if Phase 1 takes too long
+      if (elapsedMs >= PHASE1_TIMEOUT_MS) {
+        Serial.println(F("[SAFETY] Phase 1 timeout!"));
         allOff();
-        lcdClear();
+        lcd.clear();
         SystemState prev = currentState;
-        currentState = STATE_COOLING;
+        currentState = STATE_ERROR;
+        errorMessage = "PHASE1 TIMEOUT";
+        logTransition(prev, currentState);
+      }
+
+      // Pause button
+      if (btn == BTN_SHORT) {
+        Serial.println(F("[EVENT] Paused in Phase 1"));
+        pausedFromState = currentState;
+        pausedTime = elapsedMs;
+        allOff();
+        lcd.clear();
+        SystemState prev = currentState;
+        currentState = STATE_PAUSED;
         logTransition(prev, currentState);
       }
       break;
+    }
 
-    case STATE_PHASE2_ROAST:
+    case STATE_PHASE2_ROAST: {
+      unsigned long elapsedMs = now - phaseStartTime;
+      
       pidInput = currentTemp;
       if (myPID.Compute()) {
-        heaterSetPower((uint8_t)pidOutput);
+        updateHeater();
       }
 
-      updateFanFeedback();
+      updateFan();
 
       if (now - lastLCDTime >= 500) {
         lastLCDTime = now;
-        displayPhase2();
+        displayPhase(2, elapsedMs, PHASE2_DURATION_MS);
       }
 
-      if (now - phaseStartTime >= PHASE2_DURATION_MS) {
-        roastEndTime = rtc.now();
-        allOff();
-        fanOn_();
-        Serial.println(F("[OUTPUT] Phase 2 done — Heater OFF, Fan ON (cooling)"));
-        lcdClear();
+      // End Phase 2 after 30 minutes
+      if (elapsedMs >= PHASE2_DURATION_MS) {
+        heaterOff();
+        Serial.println(F("[OUTPUT] Phase 2 done — 30 min roasting complete!"));
+        Serial.println(F("[OUTPUT] Starting Phase 3: Tempering for 10 min..."));
+        Serial.println(F("[OUTPUT] Heater: OFF, Fan continues"));
+
+        pidSetpoint = PHASE3_SETPOINT;
+        heaterOff();
+        phaseStartTime = millis();
+        lastLCDTime = now;
+        lcd.clear();
+
         SystemState prev = currentState;
-        currentState = STATE_COOLING;
+        currentState = STATE_PHASE3_TEMPER;
         logTransition(prev, currentState);
       }
 
-      if (btn == BTN_LONG) {
-        roastEndTime = rtc.now();
+      // Pause button
+      if (btn == BTN_SHORT) {
+        Serial.println(F("[EVENT] Paused in Phase 2"));
+        pausedFromState = currentState;
+        pausedTime = elapsedMs;
         allOff();
-        fanOn_();
-        Serial.println(F("[EVENT] Manual stop in Phase 2 — cooling"));
-        lcdClear();
+        lcd.clear();
         SystemState prev = currentState;
-        currentState = STATE_COOLING;
+        currentState = STATE_PAUSED;
         logTransition(prev, currentState);
       }
       break;
+    }
 
-    case STATE_COOLING:
+    case STATE_PHASE3_TEMPER: {
+      unsigned long elapsedMs = now - phaseStartTime;
+      
       heaterOff();
-      valveClose();
-      fanOn_();
+      updateFan();
 
       if (now - lastLCDTime >= 500) {
         lastLCDTime = now;
-        displayCooling();
+        displayPhase(3, elapsedMs, PHASE3_DURATION_MS);
       }
 
-      if (currentTemp <= COOLING_TEMP_TARGET) {
-        fanOff();
-        Serial.print(F("[COOLING] Target reached (<="));
-        Serial.print(COOLING_TEMP_TARGET, 0);
-        Serial.print(F("C). Temp="));
-        Serial.print(currentTemp, 1);
-        Serial.println(F("C — Fan OFF"));
-        lcdClear();
+      // End Phase 3 after 10 minutes
+      if (elapsedMs >= PHASE3_DURATION_MS) {
+        allOff();
+        Serial.println(F("[OUTPUT] Phase 3 done — Tempering complete!"));
+        Serial.println(F("[OUTPUT] All outputs OFF"));
+        lcd.clear();
+
         SystemState prev = currentState;
         currentState = STATE_DONE;
         logTransition(prev, currentState);
+      }
+
+      // Pause button
+      if (btn == BTN_SHORT) {
+        Serial.println(F("[EVENT] Paused in Phase 3"));
+        pausedFromState = currentState;
+        pausedTime = elapsedMs;
+        allOff();
+        lcd.clear();
+        SystemState prev = currentState;
+        currentState = STATE_PAUSED;
+        logTransition(prev, currentState);
+      }
+      break;
+    }
+
+    case STATE_PAUSED:
+      // All outputs stay OFF (already turned off in previous state)
+      
+      if (now - lastLCDTime >= 500) {
+        lastLCDTime = now;
+        displayPaused();
+      }
+
+      // Resume button
+      if (btn == BTN_SHORT) {
+        Serial.println(F("[EVENT] Resumed"));
+        phaseStartTime = now - pausedTime;  // Adjust start time to continue timer
+        lastLCDTime = now;
+        lcd.clear();
+        
+        SystemState prev = currentState;
+        currentState = pausedFromState;
+        logTransition(prev, currentState);
+      }
+
+      // Emergency reset (long press)
+      if (btn == BTN_LONG) {
+        Serial.println(F("[EVENT] Emergency reset"));
+        allOff();
+        peakTemp = 0.0;
+        lcd.clear();
+        
+        SystemState prev = currentState;
+        currentState = STATE_IDLE;
+        logTransition(prev, currentState);
+        displayIdle();
       }
       break;
 
@@ -689,12 +676,16 @@ void loop() {
         displayDone();
       }
 
-      if (btn != BTN_NONE) {
+      // Reset button
+      if (btn == BTN_SHORT) {
         Serial.println(F("[EVENT] Button → IDLE"));
-        lcdClear();
+        peakTemp = 0.0;
+        lcd.clear();
+        
         SystemState prev = currentState;
         currentState = STATE_IDLE;
         logTransition(prev, currentState);
+        displayIdle();
       }
       break;
 
@@ -706,13 +697,17 @@ void loop() {
         displayError();
       }
 
-      if (btn != BTN_NONE) {
+      // Reset button
+      if (btn == BTN_SHORT) {
         Serial.println(F("[EVENT] Button → reset to IDLE"));
-        SystemState prev = currentState;
         errorMessage = "";
-        lcdClear();
+        peakTemp = 0.0;
+        lcd.clear();
+        
+        SystemState prev = currentState;
         currentState = STATE_IDLE;
         logTransition(prev, currentState);
+        displayIdle();
       }
       break;
   }
@@ -726,43 +721,39 @@ void loop() {
     sprintf(timeBuf, "%02d:%02d:%02d",
             nowRtc.hour(), nowRtc.minute(), nowRtc.second());
 
-    Serial.print(F("["));        Serial.print(timeBuf);      Serial.print(F("] STATE:"));
+    Serial.print(F("["));
+    Serial.print(timeBuf);
+    Serial.print(F("] STATE:"));
     printStateLabel(currentState);
 
-    Serial.print(F(" | TEMP:")); Serial.print(currentTemp, 1); Serial.print(F("C"));
-    Serial.print(F(" | SP:"));   Serial.print(pidSetpoint, 0); Serial.print(F("C"));
-    Serial.print(F(" | PEAK:")); Serial.print(peakTemp, 1);    Serial.print(F("C"));
+    Serial.print(F(" | TEMP:"));
+    Serial.print(currentTemp, 1);
+    Serial.print(F("C | SP:"));
+    Serial.print(pidSetpoint, 0);
+    Serial.print(F("C | PEAK:"));
+    Serial.print(peakTemp, 1);
+    Serial.print(F("C"));
 
-    if (currentState == STATE_PHASE1_PREHEAT) {
-      unsigned long el  = now - phaseStartTime;
-      unsigned long rem = (el < PHASE1_DURATION_MS) ? (PHASE1_DURATION_MS - el) : 0;
-      Serial.print(F(" | ELAP:")); Serial.print(el  / 1000UL); Serial.print(F("s"));
-      Serial.print(F(" REM:"));    Serial.print(rem / 1000UL); Serial.print(F("s"));
-      Serial.print(F(" | VALVE:")); Serial.print(valveOpen ? F("OPEN") : F("CLSD"));
+    if (currentState == STATE_PHASE1_PREHEAT || 
+        currentState == STATE_PHASE2_ROAST || 
+        currentState == STATE_PHASE3_TEMPER) {
+      unsigned long el = now - phaseStartTime;
+      Serial.print(F(" | ELAPSED:"));
+      Serial.print(el / 1000UL);
+      Serial.print(F("s"));
     }
 
-    if (currentState == STATE_PHASE2_ROAST) {
-      unsigned long el  = now - phaseStartTime;
-      unsigned long rem = (el < PHASE2_DURATION_MS) ? (PHASE2_DURATION_MS - el) : 0;
-      int irPct = (int)map((long)pidOutput, 0, 255, 0, 100);
-      Serial.print(F(" | ELAP:"));    Serial.print(el  / 1000UL); Serial.print(F("s"));
-      Serial.print(F(" REM:"));       Serial.print(rem / 1000UL); Serial.print(F("s"));
-      Serial.print(F(" | PID_OUT:")); Serial.print(pidOutput, 0);
-      Serial.print(F(" BRIGHT:"));    Serial.print((uint8_t)pidOutput);
-      Serial.print(F(" IR:"));        Serial.print(irPct); Serial.print(F("%"));
-    }
-
-    if (currentState == STATE_COOLING) {
-      Serial.print(F(" | TARGET:<="));
-      Serial.print(COOLING_TEMP_TARGET, 0);
-      Serial.print(F("C"));
-    }
-
-    Serial.print(F(" | FAN:"));   Serial.print(fanOn    ? F("ON")   : F("OFF"));
-    Serial.print(F(" | VALVE:")); Serial.print(valveOpen ? F("OPEN") : F("CLSD"));
+    Serial.print(F(" | HTR:"));
+    Serial.print(heaterOn ? F("ON") : F("OFF"));
+    Serial.print(F(" | FAN:"));
+    Serial.print(fanOn ? F("ON") : F("OFF"));
+    Serial.print(F(" | VLV:"));
+    Serial.print(valveOpen ? F("OPEN") : F("CLSD"));
 
     if (currentState == STATE_ERROR) {
-      Serial.print(F(" | ERR:[")); Serial.print(errorMessage); Serial.print(F("]"));
+      Serial.print(F(" | ERR:["));
+      Serial.print(errorMessage);
+      Serial.print(F("]"));
     }
 
     Serial.println();
